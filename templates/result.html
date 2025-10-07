@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Prediction Results</title>
+<style>
+ body {
+ font-family: Arial, sans-serif;
+ text-align: center;
+ margin-top: 40px;
+ background: #f8f9fa;
+ }
+h2 {
+color: #333;
+margin-bottom: 20px;
+ }
+ .grid {
+ display: flex;
+ flex-wrap: wrap;
+ justify-content: center;
+ gap: 20px;
+ margin: 30px;
+}
+.card {
+background: white;
+border-radius: 10px;
+box-shadow: 0 0 10px rgba(0,0,0,0.1);
+ padding: 15px;
+ width: 200px;
+}
+ .card img {
+ width: 100%;
+ height: 160px;
+ object-fit: cover;
+ border-radius: 8px;
+}
+ .label {
+ margin-top: 10px;
+ font-weight: bold;
+color: #007BFF;
+}
+ .confidence {
+font-size: 14px;
+ color: #555;
+ }
+a {
+ display: inline-block;
+margin-top: 25px;
+text-decoration: none;
+color: #007BFF;
+font-weight: bold;
+}
+a:hover {
+text-decoration: underline;
+}
+ </style>
+</head>
+<body>
+<h1>{{ message }}</h1>
+<h2>Prediction Results</h2>
+
+<div class="grid"> 
+    {% for result in results %}
+<div class="card">
+<h3>{{ result.filename }}</h3>
+
+{% if result.label != 'ERROR' %}
+             <img src="{{ url_for('static', filename=result.filename) }}" alt="Note Image">
+<p class="label">Result: {{ result.label }}</p>
+ <p class="confidence">Confidence: {{ result.confidence }}%</p>
+ {% else %}
+ <p style="color: red;">Error processing file.</p>
+                    <p style="font-size: 12px;">{{ result.error_message }}</p>
+{% endif %}
+</div>
+   {% endfor %} 
+    </div>
+
+<p><a href="{{ url_for('index') }}">Upload More Files</a></p>
+<p>
+  <a href="{{ url_for('download_report', filename=report_filename) }}">
+    Download Full Report (Excel)
+  </a>
+    </p>
+</body>
+</html>
