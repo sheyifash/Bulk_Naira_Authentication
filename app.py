@@ -4,40 +4,21 @@ import gdown
 import pandas as pd
 from flask import Flask, request, jsonify, render_template, redirect, url_for, send_from_directory
 from flask_cors import CORS
-from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing.image import load_img, img_to_array
-from werkzeug.utils import secure_filename 
+from werkzeug.utils import secure_filename
+import tensorflow.lite as tflite
 
-# ==============================
-# Configuration
-# ==============================
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-# Download the model from Google Drive
-file_id = '1Fo7f37x3ALDjxEqp-M55fVBrMjKdLr-L'  # Replace with your actual file ID
-url = f'https://drive.google.com/file/d/1Fo7f37x3ALDjxEqp-M55fVBrMjKdLr-L/view?usp=sharing'
-output = 'model.h5'
+MODEL_PATH = "model.tflite"
+MODEL_DRIVE_ID = "1NZZw7mgTFUYb5QpYxGMIpT3iHwi0541e"  # your tflite file ID
+UPLOAD_FOLDER = "static/uploads"
+REPORTS_DIR = "model/reports"
 
-# ==============================
-# Download & Load Model
-# ==============================
-MODEL_PATH = "model.h5"
-
-# Download the model from Google Drive if not already downloaded
-if not os.path.exists(MODEL_PATH):
-    print("📥 Downloading model from Google Drive...")
-    try:
-        # Direct download link (replace with your file ID if different)
-        gdown.download(
-            "https://drive.google.com/uc?id=1Fo7f37x3ALDjxEqp-M55fVBrMjKdLr-L",
-            MODEL_PATH,
-            quiet=False
-        )
-        print("✅ Model downloaded successfully!")
-    except Exception as e:
-        print(f"❌ Failed to download model: {e}")
-
-# (Model is already loaded above after download)
-
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(REPORTS_DIR, exist_ok=True)
 
 CLASS_MAPPING = {
     0: "fake_1000",
@@ -46,204 +27,184 @@ CLASS_MAPPING = {
     3: "genuine_500"
 }
 
-# UPLOAD_FOLDER is set inside 'static' so the browser can display the images
-UPLOAD_FOLDER = "static/uploads"
-# REPORTS_DIR is kept private, requiring the custom download route
-REPORTS_DIR = "model/reports"
+# ============================================================
+# INITIALIZE FLASK
+# ============================================================
 
-# Create directories if they don't exist
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(REPORTS_DIR, exist_ok=True)
-
-# ==============================
-# Initialize Flask App
-# ==============================
-# Flask will serve files from the 'static' folder automatically
 app = Flask(__name__)
 CORS(app)
 
-# ==============================
-# Load Model
-# ==============================
-print(f"🔍 Loading model from: {MODEL_PATH}")
-try:
-    model = load_model(MODEL_PATH)
-    print("✅ Model loaded successfully!")
-except Exception as e:
-    print(f"❌ Error loading model: {e}")
-    model = None # Set model to None if loading fails
+# ============================================================
+# MODEL HANDLER (TFLITE)
+# ============================================================
 
-# ==============================
-# Helper Function - Predict Image
-# ==============================
+interpreter = None
+input_details = None
+output_details = None
+
+def download_model_if_needed():
+    """Download model from Google Drive if missing."""
+    if not os.path.exists(MODEL_PATH):
+        print("📥 Downloading TFLite model from Google Drive...")
+        try:
+            gdown.download(
+                f"https://drive.google.com/uc?id={MODEL_DRIVE_ID}",
+                MODEL_PATH,
+                quiet=False
+            )
+            print("✅ Model downloaded successfully!")
+        except Exception as e:
+            print(f"❌ Failed to download model: {e}")
+
+def load_tflite_model():
+    """Load TensorFlow Lite model once."""
+    global interpreter, input_details, output_details
+    if interpreter is None:
+        download_model_if_needed()
+        try:
+            print(f"🔍 Loading TFLite model from: {MODEL_PATH}")
+            interpreter = tflite.Interpreter(model_path=MODEL_PATH)
+            interpreter.allocate_tensors()
+            input_details = interpreter.get_input_details()
+            output_details = interpreter.get_output_details()
+            print("✅ TFLite model loaded successfully!")
+        except Exception as e:
+            print(f"❌ Error loading TFLite model: {e}")
+            interpreter = None
+
+# Load model once
+load_tflite_model()
+
+# ============================================================
+# IMAGE PREDICTION FUNCTION
+# ============================================================
+
 def predict_image(image_path):
-    """Loads, preprocesses, and predicts the class of a single image."""
-    if model is None:
+    if interpreter is None:
         raise Exception("Model not loaded.")
-        
-    input_shape = model.input_shape[1:3]
-    
-    # Image loading and preprocessing
+
+    # Determine input shape (e.g. (1, 224, 224, 3))
+    input_shape = input_details[0]['shape'][1:3]
     img = load_img(image_path, target_size=input_shape)
     img_array = img_to_array(img) / 255.0
-    img_array = np.expand_dims(img_array, axis=0)
+    img_array = np.expand_dims(img_array, axis=0).astype(np.float32)
 
-    prediction = model.predict(img_array, verbose=0)
-    class_index = np.argmax(prediction)
-    class_name = CLASS_MAPPING[class_index]
+    # Run inference
+    interpreter.set_tensor(input_details[0]['index'], img_array)
+    interpreter.invoke()
+    prediction = interpreter.get_tensor(output_details[0]['index'])[0]
+
+    class_index = int(np.argmax(prediction))
     confidence = float(np.max(prediction))
+    class_name = CLASS_MAPPING.get(class_index, "Unknown")
 
     return {
         "predicted_class": class_name,
         "confidence": confidence
     }
 
-# ==============================
-# API Route - Serve Templates (The 'index' endpoint FIX)
-# ==============================
+# ============================================================
+# ROUTES
+# ============================================================
+
 @app.route("/")
 def index():
-    """Serves the main file upload page (index.html)."""
     return render_template("index.html")
 
-# ==============================
-# API Route - Single Prediction (Using 'images' key as requested)
-# ==============================
 @app.route("/predict", methods=["POST"])
 def predict():
     if "images" not in request.files:
-        return redirect(url_for('index'))
+        return redirect(url_for("index"))
 
     file = request.files["images"]
     if file.filename == "":
-        return redirect(url_for('index'))
+        return redirect(url_for("index"))
 
     filename = secure_filename(file.filename)
-    # File path for saving in static/uploads
     file_path = os.path.join(UPLOAD_FOLDER, filename)
-    
-    # Save file temporarily
     file.save(file_path)
 
     try:
-        # Get prediction result
         result = predict_image(file_path)
-        
-        # Prepare data for the HTML template. 
-        # The path needs to be relative to the static folder ('uploads/filename.jpg')
-        image_url = os.path.join("uploads", filename) 
-        
-        # NOTE: This route is primarily for single-file tests.
+        image_url = os.path.join("uploads", filename)
         return render_template(
-            "result.html", 
+            "result.html",
             message="Single Prediction Complete",
-            results=[{ # Wrap single result in a list for consistent template use
+            results=[{
                 "filename": image_url,
-                "label": result['predicted_class'],
-                "confidence": round(result['confidence'], 2), 
+                "label": result["predicted_class"],
+                "confidence": round(result["confidence"], 2),
             }],
-            # Dummy report filename is needed for the download button to render
-            report_filename="N/A" 
+            report_filename="N/A"
         )
-
     except Exception as e:
-        print(f"❌ FATAL ERROR during single prediction: {e}")
-        # Clean up must happen in finally block regardless of error
-        return redirect(url_for('index')) 
-        
+        print(f"❌ Error predicting single file: {e}")
+        return redirect(url_for("index"))
     finally:
-        # Cleanup: Delete the file immediately after use
         if os.path.exists(file_path):
             os.remove(file_path)
-            # print(f"DEBUG: Cleaned up file {file_path}")
 
-
-# ==============================
-# API Route - Bulk Folder Prediction (Targeted by frontend)
-# ==============================
 @app.route("/predict_bulk", methods=["POST"])
 def predict_bulk():
-    # Check for the 'images' key from the HTML form
     if "images" not in request.files:
         return jsonify({"error": "No files uploaded"}), 400
 
     files = request.files.getlist("images")
     results = []
-    
+
     for file in files:
         if file.filename == "":
-            continue # Skip empty files
+            continue
 
         filename = secure_filename(file.filename)
-        # File path for saving in static/uploads
         file_path = os.path.join(UPLOAD_FOLDER, filename)
         file.save(file_path)
 
         try:
             raw_result = predict_image(file_path)
-            
-            # The 'filename' for the template is relative to static folder ('uploads/filename.jpg')
-            image_url_for_template = os.path.join("uploads", filename)
-
-            formatted_result = {
-                "filename": image_url_for_template,
+            results.append({
+                "filename": os.path.join("uploads", filename),
                 "label": raw_result["predicted_class"],
                 "confidence": round(raw_result["confidence"], 2)
-            }
-            results.append(formatted_result)
-
+            })
         except Exception as e:
             print(f"❌ Error predicting file {filename}: {e}")
-            error_result = {"filename": os.path.join("uploads", filename), "label": "ERROR", "confidence": 0.0, "error_message": str(e)}
-            results.append(error_result)
-            
+            results.append({
+                "filename": os.path.join("uploads", filename),
+                "label": "ERROR",
+                "confidence": 0.0
+            })
         finally:
-            # Cleanup: Delete the file immediately after use
             if os.path.exists(file_path):
                 os.remove(file_path)
-    
-    if not results:
-        return jsonify({"error": "No valid files were processed"}), 400
 
-    # 1. Save results to Excel
+    if not results:
+        return jsonify({"error": "No valid files processed"}), 400
+
+    # Save results to Excel
     df = pd.DataFrame(results)
-    # The full path to the saved report
     report_path = os.path.join(REPORTS_DIR, "bulk_prediction_report.xlsx")
     df.to_excel(report_path, index=False)
-    
-    # 2. Extract only the filename for the download link
     report_filename = os.path.basename(report_path)
 
-    # 3. Return the HTML template
     return render_template(
         "result.html",
         message="Bulk Prediction Complete!",
-        results=results, 
-        report_filename=report_filename # Passed to url_for('download_report', filename=...)
+        results=results,
+        report_filename=report_filename
     )
 
-# ==============================
-# API Route - Download Report (FIX for 404 Error)
-# ==============================
 @app.route("/download_report/<filename>")
 def download_report(filename):
-    """Safely serves the prediction report file for download."""
     safe_filename = secure_filename(filename)
-    
     try:
-        # Use send_from_directory to serve the file from the REPORTS_DIR
-        return send_from_directory(
-            REPORTS_DIR, 
-            safe_filename, 
-            as_attachment=True # Forces download
-        )
+        return send_from_directory(REPORTS_DIR, safe_filename, as_attachment=True)
     except FileNotFoundError:
         return "Report not found.", 404
 
-
-# ==============================
-# Run Flask App
-# ==============================
-if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 5000))  # Render gives a PORT automatically
-    app.run(host='0.0.0.0', port=port)
+# ============================================================
+# RUN
+# ============================================================
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
