@@ -1,5 +1,6 @@
 import os
 import numpy as np
+import gdown
 import pandas as pd
 from flask import Flask, request, jsonify, render_template, redirect, url_for, send_from_directory
 from flask_cors import CORS
@@ -11,7 +12,33 @@ from werkzeug.utils import secure_filename
 # Configuration
 # ==============================
 
-MODEL_PATH = "model/outputs/naira_auth_model.h5"
+# Download the model from Google Drive
+file_id = '1Fo7f37x3ALDjxEqp-M55fVBrMjKdLr-L'  # Replace with your actual file ID
+url = f'https://drive.google.com/file/d/1Fo7f37x3ALDjxEqp-M55fVBrMjKdLr-L/view?usp=sharing'
+output = 'model.h5'
+
+# ==============================
+# Download & Load Model
+# ==============================
+MODEL_PATH = "model.h5"
+
+# Download the model from Google Drive if not already downloaded
+if not os.path.exists(MODEL_PATH):
+    print("📥 Downloading model from Google Drive...")
+    try:
+        # Direct download link (replace with your file ID if different)
+        gdown.download(
+            "https://drive.google.com/uc?id=1Fo7f37x3ALDjxEqp-M55fVBrMjKdLr-L",
+            MODEL_PATH,
+            quiet=False
+        )
+        print("✅ Model downloaded successfully!")
+    except Exception as e:
+        print(f"❌ Failed to download model: {e}")
+
+# (Model is already loaded above after download)
+
+
 CLASS_MAPPING = {
     0: "fake_1000",
     1: "fake_500",
@@ -217,5 +244,6 @@ def download_report(filename):
 # ==============================
 # Run Flask App
 # ==============================
-if __name__ == "__main__":
-    app.run(debug=True)
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 5000))  # Render gives a PORT automatically
+    app.run(host='0.0.0.0', port=port)
