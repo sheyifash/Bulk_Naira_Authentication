@@ -1,25 +1,24 @@
+# app.py (TFLite-ready)
 import os
+import io
 import numpy as np
 import gdown
 import pandas as pd
+from PIL import Image
 from flask import Flask, request, jsonify, render_template, redirect, url_for, send_from_directory
 from flask_cors import CORS
-from tensorflow.keras.preprocessing.image import load_img, img_to_array
+
 from werkzeug.utils import secure_filename
-import tensorflow.lite as tflite
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-MODEL_PATH = "model.tflite"
-MODEL_DRIVE_ID = "1NZZw7mgTFUYb5QpYxGMIpT3iHwi0541e"  # your tflite file ID
+# -------------------------
+# CONFIG
+# -------------------------
+MODEL_DRIVE_ID = "1NZZw7mgTFUYb5QpYxGMIpT3iHwi0541e"   # <--- replace with your TFLITE file id if different
+TFLITE_PATH = "model.tflite"
 UPLOAD_FOLDER = "static/uploads"
 REPORTS_DIR = "model/reports"
-
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(REPORTS_DIR, exist_ok=True)
-
 CLASS_MAPPING = {
     0: "fake_1000",
     1: "fake_500",
@@ -27,91 +26,118 @@ CLASS_MAPPING = {
     3: "genuine_500"
 }
 
-# ============================================================
-# INITIALIZE FLASK
-# ============================================================
-
+# -------------------------
+# FLASK
+# -------------------------
 app = Flask(__name__)
 CORS(app)
 
-# ============================================================
-# MODEL HANDLER (TFLITE)
-# ============================================================
+# -------------------------
+# TFLite helper: load interpreter (tflite_runtime preferred)
+# -------------------------
+def download_tflite_if_needed():
+    if not os.path.exists(TFLITE_PATH):
+        print("📥 Downloading TFLite model from Drive...")
+        url = f"https://drive.google.com/uc?id={MODEL_DRIVE_ID}"
+        gdown.download(url, TFLITE_PATH, quiet=False)
 
-interpreter = None
-input_details = None
-output_details = None
-
-def download_model_if_needed():
-    """Download model from Google Drive if missing."""
-    if not os.path.exists(MODEL_PATH):
-        print("📥 Downloading TFLite model from Google Drive...")
+def load_interpreter(path):
+    # Try lightweight runtime first
+    try:
+        import tflite_runtime.interpreter as tflite_rt
+        Interpreter = tflite_rt.Interpreter
+        print("Using tflite_runtime.interpreter")
+    except Exception:
+        # Fallback to TensorFlow's TFLite interpreter if full TF installed
         try:
-            gdown.download(
-                f"https://drive.google.com/uc?id={MODEL_DRIVE_ID}",
-                MODEL_PATH,
-                quiet=False
-            )
-            print("✅ Model downloaded successfully!")
+            from tensorflow.lite import Interpreter
+            print("Using tensorflow.lite.Interpreter (fallback)")
         except Exception as e:
-            print(f"❌ Failed to download model: {e}")
+            raise RuntimeError("No TFLite interpreter available. Install 'tflite-runtime' or 'tensorflow'.") from e
 
-def load_tflite_model():
-    """Load TensorFlow Lite model once."""
-    global interpreter, input_details, output_details
+    interpreter = Interpreter(model_path=path)
+    interpreter.allocate_tensors()
+    return interpreter
+
+# Download and load once
+download_tflite_if_needed()
+try:
+    interpreter = load_interpreter(TFLITE_PATH)
+    print("✅ TFLite interpreter loaded")
+except Exception as e:
+    interpreter = None
+    print("❌ Could not load TFLite interpreter:", e)
+
+# -------------------------
+# Utility: softmax fallback
+# -------------------------
+def softmax(x):
+    e = np.exp(x - np.max(x))
+    return e / e.sum()
+
+# -------------------------
+# Predict function for a single image using TFLite interpreter
+# -------------------------
+def predict_image_tflite(image_path, interpreter):
     if interpreter is None:
-        download_model_if_needed()
-        try:
-            print(f"🔍 Loading TFLite model from: {MODEL_PATH}")
-            interpreter = tflite.Interpreter(model_path=MODEL_PATH)
-            interpreter.allocate_tensors()
-            input_details = interpreter.get_input_details()
-            output_details = interpreter.get_output_details()
-            print("✅ TFLite model loaded successfully!")
-        except Exception as e:
-            print(f"❌ Error loading TFLite model: {e}")
-            interpreter = None
+        raise RuntimeError("Model interpreter not loaded")
 
-# Load model once
-load_tflite_model()
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
 
-# ============================================================
-# IMAGE PREDICTION FUNCTION
-# ============================================================
+    # Input shape: e.g., [1, height, width, 3]
+    in_shape = input_details[0]['shape']
+    h, w = int(in_shape[1]), int(in_shape[2])
 
-def predict_image(image_path):
-    if interpreter is None:
-        raise Exception("Model not loaded.")
+    # Load & resize
+    img = Image.open(image_path).convert("RGB").resize((w, h))
+    arr = np.array(img)
 
-    # Determine input shape (e.g. (1, 224, 224, 3))
-    input_shape = input_details[0]['shape'][1:3]
-    img = load_img(image_path, target_size=input_shape)
-    img_array = img_to_array(img) / 255.0
-    img_array = np.expand_dims(img_array, axis=0).astype(np.float32)
+    # Handle input dtype/quantization
+    input_dtype = input_details[0]['dtype']
+    if np.issubdtype(input_dtype, np.floating):
+        arr = arr.astype(np.float32) / 255.0
+    else:
+        # assume uint8 quantized input
+        arr = arr.astype(np.uint8)
 
-    # Run inference
-    interpreter.set_tensor(input_details[0]['index'], img_array)
+    # Add batch dim
+    input_data = np.expand_dims(arr, axis=0)
+
+    # If quantized input with scale/zero_point, let interpreter handle via set_tensor (we already used uint8)
+    interpreter.set_tensor(input_details[0]['index'], input_data)
     interpreter.invoke()
-    prediction = interpreter.get_tensor(output_details[0]['index'])[0]
 
-    class_index = int(np.argmax(prediction))
-    confidence = float(np.max(prediction))
-    class_name = CLASS_MAPPING.get(class_index, "Unknown")
+    raw_output = interpreter.get_tensor(output_details[0]['index'])
 
-    return {
-        "predicted_class": class_name,
-        "confidence": confidence
-    }
+    # If output is quantized, dequantize
+    scale, zero_point = output_details[0].get('quantization', (0.0, 0))
+    if scale and scale != 0:
+        logits = (raw_output.astype(np.float32) - zero_point) * scale
+    else:
+        logits = raw_output.astype(np.float32)
 
-# ============================================================
-# ROUTES
-# ============================================================
+    probs = logits[0]
+    # If output isn't softmaxed, apply softmax:
+    if probs.sum() <= 1.0 + 1e-6 and probs.max() <= 1.0:
+        # It already looks like probabilities (likely float softmax or quantized softmax)
+        pass
+    else:
+        probs = softmax(probs)
 
-@app.route("/")
-def index():
-    return render_template("index.html")
+    class_index = int(np.argmax(probs))
+    confidence = float(np.max(probs))
+    class_name = CLASS_MAPPING.get(class_index, f"class_{class_index}")
 
-@app.route("/predict", methods=["POST"])
+    return {"predicted_class": class_name, "confidence": confidence}
+
+# -------------------------
+# ROUTES (same behavior you already have)
+# -------------------------
+    @app.route("/")
+    def index():
+return render_template("index.html")
+    @app.route("/predict", methods=["POST"])
 def predict():
     if "images" not in request.files:
         return redirect(url_for("index"))
@@ -119,92 +145,64 @@ def predict():
     file = request.files["images"]
     if file.filename == "":
         return redirect(url_for("index"))
-
-    filename = secure_filename(file.filename)
-    file_path = os.path.join(UPLOAD_FOLDER, filename)
-    file.save(file_path)
+filename = secure_filename(file.filename)
+file_path = os.path.join(UPLOAD_FOLDER, filename)
+file.save(file_path)
 
     try:
-        result = predict_image(file_path)
+        result = predict_image_tflite(file_path, interpreter)
         image_url = os.path.join("uploads", filename)
-        return render_template(
+    return render_template(
             "result.html",
             message="Single Prediction Complete",
-            results=[{
-                "filename": image_url,
-                "label": result["predicted_class"],
-                "confidence": round(result["confidence"], 2),
-            }],
+            results=[{"filename": image_url, "label": result["predicted_class"], "confidence": round(result["confidence"], 2)}],
             report_filename="N/A"
         )
+
     except Exception as e:
-        print(f"❌ Error predicting single file: {e}")
+        print("Predict error:", e)
         return redirect(url_for("index"))
     finally:
-        if os.path.exists(file_path):
-            os.remove(file_path)
 
-@app.route("/predict_bulk", methods=["POST"])
-def predict_bulk():
-    if "images" not in request.files:
+    if os.path.exists(file_path):
+         os.remove(file_path)
+        
+    @app.route("/predict_bulk", methods=["POST"])
+    def predict_bulk():
+        if "images" not in request.files:
         return jsonify({"error": "No files uploaded"}), 400
 
     files = request.files.getlist("images")
-    results = []
-
-    for file in files:
+     results = []
+for file in files:
         if file.filename == "":
             continue
-
-        filename = secure_filename(file.filename)
-        file_path = os.path.join(UPLOAD_FOLDER, filename)
-        file.save(file_path)
-
-        try:
-            raw_result = predict_image(file_path)
-            results.append({
-                "filename": os.path.join("uploads", filename),
-                "label": raw_result["predicted_class"],
-                "confidence": round(raw_result["confidence"], 2)
-            })
+filename = secure_filename(file.filename)
+  file_path = os.path.join(UPLOAD_FOLDER, filename)
+   file.save(file_path)
+       try:
+            res = predict_image_tflite(file_path, interpreter)
+            results.append({"filename": os.path.join("uploads", filename), "label": res["predicted_class"], "confidence": round(res["confidence"], 2)})
         except Exception as e:
-            print(f"❌ Error predicting file {filename}: {e}")
-            results.append({
-                "filename": os.path.join("uploads", filename),
-                "label": "ERROR",
-                "confidence": 0.0
-            })
-        finally:
+            print(f"Error on {filename}:", e)
+            results.append({"filename": os.path.join("uploads", filename), "label": "ERROR", "confidence": 0.0})        finally:
             if os.path.exists(file_path):
                 os.remove(file_path)
 
     if not results:
         return jsonify({"error": "No valid files processed"}), 400
-
-    # Save results to Excel
-    df = pd.DataFrame(results)
-    report_path = os.path.join(REPORTS_DIR, "bulk_prediction_report.xlsx")
-    df.to_excel(report_path, index=False)
-    report_filename = os.path.basename(report_path)
-
-    return render_template(
-        "result.html",
-        message="Bulk Prediction Complete!",
-        results=results,
-        report_filename=report_filename
-    )
-
+df = pd.DataFrame(results)
+   report_path = os.path.join(REPORTS_DIR, "bulk_prediction_report.xlsx")
+   df.to_excel(report_path, index=False)
+   report_filename = os.path.basename(report_path)
+    return render_template("result.html", message="Bulk Prediction Complete!", results=results, report_filename=report_filename)
 @app.route("/download_report/<filename>")
-def download_report(filename):
-    safe_filename = secure_filename(filename)
+    def download_report(filename):    safe_filename = secure_filename(filename)
     try:
         return send_from_directory(REPORTS_DIR, safe_filename, as_attachment=True)
     except FileNotFoundError:
         return "Report not found.", 404
-
-# ============================================================
-# RUN
-# ============================================================
-if __name__ == "__main__":
+    
+    if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
