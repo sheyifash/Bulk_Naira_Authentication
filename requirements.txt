@@ -1,8 +1,0 @@
-Flask==3.0.3
-gunicorn==20.1.0
-pandas
-numpy
-Pillow
-gdown
-openpyxl
-tflite-runtime  # unpinned; we'll rely on Python version selection so a wheel exists
