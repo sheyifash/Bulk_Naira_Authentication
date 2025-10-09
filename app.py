@@ -186,12 +186,21 @@ def predict_single_file_local(filepath):
 # ============== ROUTES ==============
 @app.route("/home")
 def home():
+    # Renders the home page where the button is located
     return render_template("home.html")
 
+# 1. Define the actual destination page (e.g., the upload/single-note prediction page)
+@app.route("/index")
+def index():
+    # This function should render your main prediction/upload template (e.g., 'index.html')
+    return render_template("index.html")
+
+# 2. Modify the redirect to point to the endpoint name (the function name 'index')
 @app.route("/")
 def index_redirect():
-    return redirect(url_for("home"))
-
+    # Redirects the browser to the '/index' URL path
+    # 'index' is the name of the function defined above
+    return redirect(url_for("index"))
 @app.route("/predict", methods=["POST"])
 def predict():
     # Single file endpoint used by your index.html form (name="images")
