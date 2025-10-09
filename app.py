@@ -116,88 +116,114 @@ def predict_image_tflite(image_path, interpreter):
 def index():
     return render_template("index.html")
 
+from tensorflow.keras.preprocessing.image import load_img, img_to_array
+from tensorflow.keras.models import load_model
 
+# Load your model once (outside routes)
+MODEL_PATH = "model/outputs/naira_auth_model.h5"
+model = load_model(MODEL_PATH)
+print("✅ Model loaded successfully for prediction!")
+
+# ----------------------------------------------------
+# SINGLE PREDICTION
+# ----------------------------------------------------
 @app.route("/predict", methods=["POST"])
 def predict():
-    if "images" not in request.files:
-        return redirect(url_for("index"))
-
-    file = request.files["images"]
-    if file.filename == "":
-        return redirect(url_for("index"))
-
-    filename = secure_filename(file.filename)
-    file_path = os.path.join(UPLOAD_FOLDER, filename)
-    file.save(file_path)
-
     try:
-        result = predict_image_tflite(file_path, interpreter)
-        image_url = os.path.join("uploads", filename)
+        if "images" not in request.files:
+            return render_template("result.html", message="❌ No image uploaded", results=[], report_filename="N/A")
+
+        file = request.files["images"]
+        if file.filename == "":
+            return render_template("result.html", message="⚠️ Empty file name", results=[], report_filename="N/A")
+
+        filename = secure_filename(file.filename)
+        filepath = os.path.join("static", "uploads", filename)
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        file.save(filepath)
+
+        img = load_img(filepath, target_size=(150, 150))
+        img_array = img_to_array(img)
+        img_array = np.expand_dims(img_array, axis=0) / 255.0
+
+        prediction = model.predict(img_array, verbose=0)
+        class_index = np.argmax(prediction)
+        confidence = float(np.max(prediction))
+        label = CLASS_MAPPING[class_index]
+
+        result = [{
+            "filename": f"uploads/{filename}",
+            "label": label,
+            "confidence": confidence
+        }]
+
         return render_template(
             "result.html",
-            message="Single Prediction Complete",
-            results=[{
-                "filename": image_url,
-                "label": result["predicted_class"],
-                "confidence": round(result["confidence"], 2)
-            }],
+            message="✅ Single Prediction Complete",
+            results=result,
             report_filename="N/A"
         )
+
     except Exception as e:
-        print("Predict error:", e)
-        return redirect(url_for("index"))
-    finally:
-        if os.path.exists(file_path):
-            os.remove(file_path)
+        print("❌ Error in /predict:", e)
+        return render_template("result.html", message=f"Error: {e}", results=[], report_filename="N/A")
 
 
+# ----------------------------------------------------
+# BULK PREDICTION
+# ----------------------------------------------------
 @app.route("/predict_bulk", methods=["POST"])
 def predict_bulk():
-    if "images" not in request.files:
-        return jsonify({"error": "No files uploaded"}), 400
+    try:
+        if "images" not in request.files:
+            return render_template("result.html", message="❌ No files uploaded", results=[], report_filename="N/A")
 
-    files = request.files.getlist("images")
-    results = []
+        files = request.files.getlist("images")
+        results = []
+        upload_folder = os.path.join("static", "uploads")
+        os.makedirs(upload_folder, exist_ok=True)
 
-    for file in files:
-        if file.filename == "":
-            continue
-        filename = secure_filename(file.filename)
-        file_path = os.path.join(UPLOAD_FOLDER, filename)
-        file.save(file_path)
+        for file in files:
+            if file.filename == "":
+                continue
 
-        try:
-            res = predict_image_tflite(file_path, interpreter)
+            filepath = os.path.join(upload_folder, secure_filename(file.filename))
+            file.save(filepath)
+
+            img = load_img(filepath, target_size=(150, 150))
+            img_array = img_to_array(img)
+            img_array = np.expand_dims(img_array, axis=0) / 255.0
+
+            prediction = model.predict(img_array, verbose=0)
+            class_index = np.argmax(prediction)
+            confidence = float(np.max(prediction))
+            label = CLASS_MAPPING[class_index]
+
             results.append({
-                "filename": os.path.join("uploads", filename),
-                "label": res["predicted_class"],
-                "confidence": round(res["confidence"], 2)
+                "filename": f"uploads/{file.filename}",
+                "label": label,
+                "confidence": confidence
             })
-        except Exception as e:
-            print(f"Error on {filename}:", e)
-            results.append({
-                "filename": os.path.join("uploads", filename),
-                "label": "ERROR",
-                "confidence": 0.0
-            })
-        finally:
-            if os.path.exists(file_path):
-                os.remove(file_path)
 
-    if not results:
-        return jsonify({"error": "No valid files processed"}), 400
+        if not results:
+            return render_template("result.html", message="⚠️ No valid images found", results=[], report_filename="N/A")
 
-    df = pd.DataFrame(results)
-    report_path = os.path.join(REPORTS_DIR, "bulk_prediction_report.xlsx")
-    df.to_excel(report_path, index=False)
-    report_filename = os.path.basename(report_path)
+        df = pd.DataFrame(results)
+        report_folder = os.path.join("model", "reports")
+        os.makedirs(report_folder, exist_ok=True)
+        report_filename = "bulk_prediction_report.xlsx"
+        df.to_excel(os.path.join(report_folder, report_filename), index=False)
 
-    return render_template(
-        "result.html",
-        message="Bulk Prediction Complete!",
-        results=results,
-        report_filename=report_filename
-    )
+        return render_template(
+            "result.html",
+            message="📦 Bulk Prediction Complete!",
+            results=results,
+            report_filename=report_filename
+        )
+
+    except Exception as e:
+        print("❌ Error in /predict_bulk:", e)
+        return render_template("result.html", message=f"Error: {e}", results=[], report_filename="N/A")
 
 
 @app.route("/download_report/<filename>")
