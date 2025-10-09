@@ -184,9 +184,13 @@ def predict_single_file_local(filepath):
     return label, confidence
 
 # ============== ROUTES ==============
+@app.route("/home")
+def home():
+    return render_template("home.html")
+
 @app.route("/")
-def index():
-    return render_template("index.html")
+def index_redirect():
+    return redirect(url_for("home"))
 
 @app.route("/predict", methods=["POST"])
 def predict():
