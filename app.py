@@ -1,96 +1,117 @@
 import os
 import numpy as np
+import gdown
 import pandas as pd
 from PIL import Image
-from flask import Flask, request, render_template, redirect, url_for, send_from_directory
+from flask import Flask, request, jsonify, render_template, redirect, url_for, send_from_directory
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
-from tensorflow.keras.preprocessing.image import ImageDataGenerator, load_img, img_to_array
-from tensorflow.keras.models import load_model
+from tflite_support.task import core
 
-# ----------------------------
-# CONFIGURATION
-# ----------------------------
-MODEL_PATH = "model/outputs/naira_auth_model.h5"
-TRAIN_DIR = "model/dataset/train"
+# -------------------------
+# CONFIG
+# -------------------------
+MODEL_DRIVE_ID = "1NZZw7mgTFUYb5QpYxGMIpT3iHwi0541e"   # Google Drive file ID for your TFLite model
+TFLITE_PATH = "model.tflite"
 UPLOAD_FOLDER = "static/uploads"
 REPORTS_DIR = "model/reports"
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(REPORTS_DIR, exist_ok=True)
 
-CONFIDENCE_THRESHOLD = 0.6  # You can adjust this
+CLASS_MAPPING = {
+    0: "fake_1000",
+    1: "fake_500",
+    2: "genuine_1000",
+    3: "genuine_500"
+}
 
-
-# ----------------------------
-# FLASK APP SETUP
-# ----------------------------
+# -------------------------
+# FLASK
+# -------------------------
 app = Flask(__name__)
 CORS(app)
 
-
-# ----------------------------
-# HELPER FUNCTIONS
-# ----------------------------
-def get_class_mapping():
-    """Auto-detects class mapping from train directory"""
-    datagen = ImageDataGenerator(rescale=1.0 / 255)
-    generator = datagen.flow_from_directory(
-        TRAIN_DIR,
-        target_size=(150, 150),
-        batch_size=1,
-        class_mode="categorical"
-    )
-    mapping = {v: k for k, v in generator.class_indices.items()}
-    print(f"🧩 Detected class mapping: {mapping}")
-    return mapping
+# -------------------------
+# TFLite model handling
+# -------------------------
+def download_tflite_if_needed():
+    """Download model from Google Drive if not found locally."""
+    if not os.path.exists(TFLITE_PATH):
+        print("📥 Downloading TFLite model from Google Drive...")
+        url = f"https://drive.google.com/uc?id={MODEL_DRIVE_ID}"
+        gdown.download(url, TFLITE_PATH, quiet=False)
 
 
-def load_trained_model():
-    """Loads the trained Keras model"""
-    print(f"🔍 Loading model from: {MODEL_PATH}")
-    model = load_model(MODEL_PATH)
-    print("✅ Model loaded successfully!")
-    return model
+def load_interpreter(path):
+    """Load TensorFlow Lite interpreter."""
+    try:
+        interpreter = tf.lite.Interpreter(model_path=path)
+        interpreter.allocate_tensors()
+        print("✅ TensorFlow Lite interpreter loaded successfully")
+        return interpreter
+    except Exception as e:
+        print("❌ Failed to load TFLite interpreter:", e)
+        return None
 
 
-def preprocess_image(image_path, target_size):
-    """Loads and preprocesses an image"""
-    img = load_img(image_path, target_size=target_size)
-    img_array = img_to_array(img)
-    img_array = np.expand_dims(img_array, axis=0).astype("float32") / 255.0
-    return img_array
+# Download and load once at startup
+download_tflite_if_needed()
+interpreter = load_interpreter(TFLITE_PATH)
 
 
-def predict_image(image_path, model, class_mapping):
-    """Predicts class of a single image"""
-    input_shape = model.input_shape[1:3]
-    img_array = preprocess_image(image_path, input_shape)
-    prediction = model.predict(img_array, verbose=0)
+def softmax(x):
+    """Softmax utility."""
+    e = np.exp(x - np.max(x))
+    return e / e.sum()
 
-    class_index = np.argmax(prediction)
-    confidence = float(np.max(prediction))
-    class_name = class_mapping.get(class_index, "Unknown")
 
-    # Apply threshold
-    if confidence < CONFIDENCE_THRESHOLD:
-        label = "Uncertain"
+def predict_image_tflite(image_path, interpreter):
+    """Predict class of a single image."""
+    if interpreter is None:
+        raise RuntimeError("Model interpreter not loaded")
+
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+
+    in_shape = input_details[0]['shape']
+    h, w = int(in_shape[1]), int(in_shape[2])
+
+    img = Image.open(image_path).convert("RGB").resize((w, h))
+    arr = np.array(img)
+
+    input_dtype = input_details[0]['dtype']
+    if np.issubdtype(input_dtype, np.floating):
+        arr = arr.astype(np.float32) / 255.0
     else:
-        label = class_name
+        arr = arr.astype(np.uint8)
 
-    return label, confidence
+    input_data = np.expand_dims(arr, axis=0)
+    interpreter.set_tensor(input_details[0]['index'], input_data)
+    interpreter.invoke()
+
+    raw_output = interpreter.get_tensor(output_details[0]['index'])
+    scale, zero_point = output_details[0].get('quantization', (0.0, 0))
+
+    if scale and scale != 0:
+        logits = (raw_output.astype(np.float32) - zero_point) * scale
+    else:
+        logits = raw_output.astype(np.float32)
+
+    probs = logits[0]
+    if not (probs.sum() <= 1.0 + 1e-6 and probs.max() <= 1.0):
+        probs = softmax(probs)
+
+    class_index = int(np.argmax(probs))
+    confidence = float(np.max(probs))
+    class_name = CLASS_MAPPING.get(class_index, f"class_{class_index}")
+
+    return {"predicted_class": class_name, "confidence": confidence}
 
 
-# ----------------------------
-# LOAD MODEL AND CLASSES ON STARTUP
-# ----------------------------
-model = load_trained_model()
-class_mapping = get_class_mapping()
-
-
-# ----------------------------
+# -------------------------
 # ROUTES
-# ----------------------------
+# -------------------------
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -98,7 +119,6 @@ def index():
 
 @app.route("/predict", methods=["POST"])
 def predict():
-    """Handles single image upload and prediction"""
     if "images" not in request.files:
         return redirect(url_for("index"))
 
@@ -111,16 +131,20 @@ def predict():
     file.save(file_path)
 
     try:
-        label, confidence = predict_image(file_path, model, class_mapping)
+        result = predict_image_tflite(file_path, interpreter)
         image_url = os.path.join("uploads", filename)
-        results = [{
-            "filename": image_url,
-            "label": label,
-            "confidence": round(confidence, 2)
-        }]
-        return render_template("result.html", message="Prediction Complete", results=results, report_filename="N/A")
+        return render_template(
+            "result.html",
+            message="Single Prediction Complete",
+            results=[{
+                "filename": image_url,
+                "label": result["predicted_class"],
+                "confidence": round(result["confidence"], 2)
+            }],
+            report_filename="N/A"
+        )
     except Exception as e:
-        print("❌ Prediction Error:", e)
+        print("Predict error:", e)
         return redirect(url_for("index"))
     finally:
         if os.path.exists(file_path):
@@ -129,9 +153,8 @@ def predict():
 
 @app.route("/predict_bulk", methods=["POST"])
 def predict_bulk():
-    """Handles multiple image uploads and prediction"""
     if "images" not in request.files:
-        return redirect(url_for("index"))
+        return jsonify({"error": "No files uploaded"}), 400
 
     files = request.files.getlist("images")
     results = []
@@ -139,20 +162,19 @@ def predict_bulk():
     for file in files:
         if file.filename == "":
             continue
-
         filename = secure_filename(file.filename)
         file_path = os.path.join(UPLOAD_FOLDER, filename)
         file.save(file_path)
 
         try:
-            label, confidence = predict_image(file_path, model, class_mapping)
+            res = predict_image_tflite(file_path, interpreter)
             results.append({
                 "filename": os.path.join("uploads", filename),
-                "label": label,
-                "confidence": round(confidence, 2)
+                "label": res["predicted_class"],
+                "confidence": round(res["confidence"], 2)
             })
         except Exception as e:
-            print(f"Error predicting {filename}:", e)
+            print(f"Error on {filename}:", e)
             results.append({
                 "filename": os.path.join("uploads", filename),
                 "label": "ERROR",
@@ -162,15 +184,20 @@ def predict_bulk():
             if os.path.exists(file_path):
                 os.remove(file_path)
 
-    if results:
-        df = pd.DataFrame(results)
-        report_path = os.path.join(REPORTS_DIR, "bulk_prediction_report.xlsx")
-        df.to_excel(report_path, index=False)
-        report_filename = os.path.basename(report_path)
-    else:
-        report_filename = "N/A"
+    if not results:
+        return jsonify({"error": "No valid files processed"}), 400
 
-    return render_template("result.html", message="Bulk Prediction Complete", results=results, report_filename=report_filename)
+    df = pd.DataFrame(results)
+    report_path = os.path.join(REPORTS_DIR, "bulk_prediction_report.xlsx")
+    df.to_excel(report_path, index=False)
+    report_filename = os.path.basename(report_path)
+
+    return render_template(
+        "result.html",
+        message="Bulk Prediction Complete!",
+        results=results,
+        report_filename=report_filename
+    )
 
 
 @app.route("/download_report/<filename>")
@@ -182,9 +209,6 @@ def download_report(filename):
         return "Report not found.", 404
 
 
-# ----------------------------
-# RUN APP
-# ----------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
