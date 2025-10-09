@@ -10,3 +10,4 @@ tensorflow-cpu==2.10.0
 tflite-support==0.4.4 
 pandas
 Pillow
+openpyxl
