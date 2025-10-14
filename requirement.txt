@@ -6,8 +6,9 @@ Flask
 Flask-Cors
 gdown
 numpy==1.24.4
-tensorflow-cpu==2.10.0  
 tflite-support==0.4.4 
 pandas
 Pillow
 openpyxl
+tensorflow==2.12.0
+
