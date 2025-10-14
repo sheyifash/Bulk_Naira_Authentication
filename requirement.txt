@@ -5,10 +5,8 @@ gunicorn
 Flask
 Flask-Cors
 gdown
-numpy==1.24.4
-tflite-support==0.4.4 
 pandas
 Pillow
 openpyxl
 tensorflow==2.12.0
-
+numpy==1.23.5
